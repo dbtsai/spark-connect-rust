@@ -29,6 +29,12 @@ installed.
 cargo run --example <name>
 ```
 
+### local Sail (Python)
+
+Run the Rust-backed PySpark client against an automatically managed local Sail
+server. The [local Sail prototype](local-sail/README.md) includes setup instructions,
+a reusable session helper, and a benchmark against a local Spark Connect server.
+
 ### sql
 
 Write a simple SQL statement and save the dataframe as a parquet
