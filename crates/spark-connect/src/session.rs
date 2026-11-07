@@ -1619,6 +1619,7 @@ fn values_to_arrow(values: &[&Value], dt: &DataType) -> Result<Arc<dyn arrow::ar
 /// conversion: a nonzero digit beyond the scale, or a value beyond the precision, is an error
 /// rather than truncated. The work is bounded by the length of the string, never by its
 /// exponent, so `1E+1000000000` fails at once.
+#[doc(hidden)]
 pub fn decimal_str_to_unscaled(s: &str, precision: i32, scale: i32) -> Result<i128> {
     if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
         return Err(SparkError::connect_msg(format!(
@@ -1796,7 +1797,7 @@ mod tests {
                 "{text}: {error}"
             );
         }
-        // Spark has no such decimal types.
+        // These decimal types are not supported by this encoder.
         for (precision, scale) in [(0, 0), (39, 0), (10, -2), (10, 11), (38, i32::MAX)] {
             assert!(decimal_str_to_unscaled("1", precision, scale).is_err());
         }

@@ -24,7 +24,8 @@ use crate::errors::ResultExt;
 use crate::row::PyRow;
 use crate::values::{PyGeography, PyGeometry, PyVariantVal};
 
-pub(crate) static DECIMAL: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static DECIMAL: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static C_DECIMAL: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DATE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static DATETIME: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static TIME: PyOnceLock<Py<PyType>> = PyOnceLock::new();
@@ -32,28 +33,49 @@ static TIMEDELTA: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static ARRAY: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static SORTED: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
+/// The C implementation's Decimal class, independent of the mutable public alias.
+pub(crate) fn c_decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    C_DECIMAL.import(py, "_decimal", "Decimal")
+}
+
+/// Keep the cached conversion class independent of a rebound public alias when C Decimal
+/// is available. Pure-Python decimal keeps its established fallback conversion.
+pub(crate) fn decimal_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    match c_decimal_type(py) {
+        Ok(decimal) => Ok(decimal),
+        Err(error) if error.is_instance_of::<pyo3::exceptions::PyImportError>(py) => {
+            DECIMAL.import(py, "decimal", "Decimal")
+        }
+        Err(error) => Err(error),
+    }
+}
+
+type Quanta = HashMap<(i32, i32), (Py<PyAny>, Py<PyDict>)>;
+
 thread_local! {
     /// The quantum and the context of each decimal type, while a [`DecimalQuanta`] lives: PySpark
     /// builds them once for the converter of a field, rather than once per value.
-    static DECIMAL_QUANTA: std::cell::RefCell<Option<HashMap<(i32, i32), (Py<PyAny>, Py<PyAny>)>>> =
+    static DECIMAL_QUANTA: std::cell::RefCell<Option<Quanta>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// While alive, the conversions of this thread build the quantum and the context of each decimal
 /// type once. Each conversion of rows has its own, as each `createDataFrame` of PySpark has its
-/// converters, so that its contexts take the `decimal.DefaultContext` of their time.
-pub(crate) struct DecimalQuanta;
+/// converters. A type's context is built lazily at its first non-null, non-NaN value,
+/// using the `decimal.DefaultContext` at that time.
+#[must_use = "bind the guard for the duration of the conversion"]
+pub(crate) struct DecimalQuanta(Option<Quanta>);
 
 impl DecimalQuanta {
     pub(crate) fn new() -> Self {
-        DECIMAL_QUANTA.with(|quanta| *quanta.borrow_mut() = Some(HashMap::new()));
-        DecimalQuanta
+        let previous = DECIMAL_QUANTA.with(|quanta| quanta.replace(Some(HashMap::new())));
+        DecimalQuanta(previous)
     }
 }
 
 impl Drop for DecimalQuanta {
     fn drop(&mut self) {
-        DECIMAL_QUANTA.with(|quanta| quanta.borrow_mut().take());
+        DECIMAL_QUANTA.with(|quanta| quanta.replace(self.0.take()));
     }
 }
 
@@ -63,21 +85,20 @@ fn decimal_quantum<'py>(
     py: Python<'py>,
     precision: i32,
     scale: i32,
-) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyDict>)> {
     let cached = DECIMAL_QUANTA.with(|quanta| {
         quanta.borrow().as_ref().and_then(|quanta| {
             quanta
                 .get(&(precision, scale))
-                .map(|(exp, context)| (exp.bind(py).clone(), context.bind(py).clone()))
+                .map(|(exp, kwargs)| (exp.bind(py).clone(), kwargs.bind(py).clone()))
         })
     });
     if let Some(cached) = cached {
         return Ok(cached);
     }
     let module = py.import(intern!(py, "decimal"))?;
-    let exp = DECIMAL
-        .import(py, "decimal", "Decimal")?
-        .call1((format!("1E-{scale}"),))?;
+    let exp = decimal_type(py)?.call1((format!("1E-{scale}"),))?;
+    // Read Context at construction time, so each conversion observes the current factory.
     let context = module.getattr(intern!(py, "Context"))?.call(
         (),
         Some(
@@ -88,15 +109,18 @@ fn decimal_quantum<'py>(
             .into_py_dict(py)?,
         ),
     )?;
+    // Keep PySpark's keyword call, including for subclass overrides, without allocating
+    // a kwargs dictionary per value. Python calls do not mutate the supplied dictionary.
+    let kwargs = [("context", context)].into_py_dict(py)?;
     DECIMAL_QUANTA.with(|quanta| {
         if let Some(quanta) = quanta.borrow_mut().as_mut() {
             quanta.insert(
                 (precision, scale),
-                (exp.clone().unbind(), context.clone().unbind()),
+                (exp.clone().unbind(), kwargs.clone().unbind()),
             );
         }
     });
-    Ok((exp, context))
+    Ok((exp, kwargs))
 }
 
 /// The session configurations that inference reads, as PySpark reads them for
@@ -306,7 +330,7 @@ pub(crate) fn infer_type(obj: &Bound<'_, PyAny>, o: Options<'_>) -> PyResult<Dat
         return Ok(DataType::Binary);
     }
     let ty = obj.get_type();
-    if ty.is(DECIMAL.import(py, "decimal", "Decimal")?) {
+    if ty.is(decimal_type(py)?) {
         // As PySpark: the precision and scale of a value may differ from row to row.
         return Ok(DataType::Decimal {
             precision: 38,
@@ -1040,7 +1064,7 @@ pub(crate) fn convert(obj: &Bound<'_, PyAny>, dt: &DataType, nullable: bool) -> 
             Ok(Value::Timestamp(wall_clock_micros(obj)?))
         }
         DataType::Decimal { precision, scale } => {
-            let decimal = DECIMAL.import(py, "decimal", "Decimal")?;
+            let decimal = decimal_type(py)?;
             if !obj.is_instance(decimal.as_any())? {
                 return Err(assertion());
             }
@@ -1052,8 +1076,8 @@ pub(crate) fn convert(obj: &Bound<'_, PyAny>, dt: &DataType, nullable: bool) -> 
             }
             // `value.quantize(Decimal("1E-<scale>"), context=Context(prec=<precision>,
             // rounding=ROUND_HALF_EVEN))`, as written: the encoder parses either notation.
-            let (exp, context) = decimal_quantum(py, *precision, *scale)?;
-            let quantized = obj.call_method1(intern!(py, "quantize"), (exp, py.None(), context))?;
+            let (exp, kwargs) = decimal_quantum(py, *precision, *scale)?;
+            let quantized = obj.call_method(intern!(py, "quantize"), (exp,), Some(&kwargs))?;
             Ok(Value::Decimal {
                 value: quantized.str()?.extract()?,
                 precision: Some(*precision),
