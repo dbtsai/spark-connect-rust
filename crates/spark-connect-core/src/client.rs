@@ -1124,20 +1124,21 @@ impl SparkConnectClient {
 
     /// The AddArtifacts call of `requests`, once. Stamps user_context and client_type on
     /// every frame; all upload paths must go through here.
-    async fn add_artifacts_rpc(
+    async fn add_artifacts_rpc<I>(
         &self,
-        requests: impl IntoIterator<Item = spark_connect_proto::AddArtifactsRequest>,
-    ) -> std::result::Result<spark_connect_proto::AddArtifactsResponse, tonic::Status> {
+        requests: I,
+    ) -> std::result::Result<spark_connect_proto::AddArtifactsResponse, tonic::Status>
+    where
+        I: IntoIterator<Item = spark_connect_proto::AddArtifactsRequest>,
+        I::IntoIter: Send + 'static,
+    {
         let user_context = self.artifact_user_context();
         let client_type = self.user_agent.clone();
-        let requests: Vec<_> = requests
-            .into_iter()
-            .map(|mut request| {
-                request.user_context = Some(user_context.clone());
-                request.client_type = Some(client_type.clone());
-                request
-            })
-            .collect();
+        let requests = requests.into_iter().map(move |mut request| {
+            request.user_context = Some(user_context.clone());
+            request.client_type = Some(client_type.clone());
+            request
+        });
         let mut req = with_deadline(
             Request::new(futures::stream::iter(requests)),
             self.rpc_deadlines.add_artifacts,
@@ -1611,6 +1612,35 @@ mod tests {
         // connect() is lazy; the empty upload must return without dialing a server.
         let client = SparkConnectClient::connect(&builder).await.unwrap();
         assert!(client.cache_artifacts(Vec::new()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_artifact_requests_wait_for_transport_demand() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Reserve a local endpoint without serving HTTP/2. On this runtime, the
+        // channel worker cannot request a body until the upload yields.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let builder =
+            ChannelBuilder::parse(&format!("sc://{}", listener.local_addr().unwrap())).unwrap();
+        let client = SparkConnectClient::connect(&builder).await.unwrap();
+        let generated = Arc::new(AtomicUsize::new(0));
+        let observed = generated.clone();
+        let requests = cache_artifact_requests(
+            client.session_id().to_string(),
+            vec![(
+                "cache/blob".to_string(),
+                bytes::Bytes::from(vec![1; crate::artifact::CHUNK_SIZE * 3]),
+            )],
+        )
+        .inspect(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut upload = std::pin::pin!(client.add_artifacts_rpc(requests));
+
+        assert!(futures::poll!(&mut upload).is_pending());
+        assert_eq!(generated.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
